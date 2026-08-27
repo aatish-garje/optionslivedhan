@@ -1,0 +1,8 @@
+numpy
+pandas
+requests
+pytz
+streamlit
+websocket-client
+streamlit-autorefresh
+dhanhq
