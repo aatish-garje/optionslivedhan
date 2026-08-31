@@ -3,8 +3,8 @@ from urllib.parse import urlparse, parse_qs
 import webbrowser
 
 # --- REPLACE THESE WITH YOUR EXACT FYERS APP DETAILS ---
-client_id = "673LRIBD6X-200"       
-secret_key = "LsQXlwwaNE"      
+client_id = "client_id"       
+secret_key = "secret_id"      
 redirect_uri = "https://127.0.0.1/"
 # -------------------------------------------------------
 
