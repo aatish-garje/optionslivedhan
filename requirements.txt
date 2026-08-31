@@ -5,5 +5,3 @@ numpy
 scipy
 pytz
 fyers-apiv3
-webbrowser
-urllib.parse
