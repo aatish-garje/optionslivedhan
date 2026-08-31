@@ -1,8 +1,7 @@
-numpy
-pandas
-requests
-pytz
 streamlit
-websocket-client
 streamlit-autorefresh
-dhanhq
+pandas
+numpy
+scipy
+pytz
+fyers-apiv3
