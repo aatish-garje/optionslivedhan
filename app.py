@@ -83,7 +83,7 @@ def build_risk_config(sidebar_values: dict) -> RiskConfig:
 
 
 def main():
-    st.set_page_config(page_title="PRO Scalping & Intraday Paper Trading Engine", layout="wide")
+    st.set_page_config(page_title="Options Paper Trading Engine", layout="wide")
     state = get_engine_state()
 
     if "initialized" not in st.session_state:
