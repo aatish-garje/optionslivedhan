@@ -2,22 +2,6 @@
 ================================================================================
  ⚡ PRO Quant Options Signal Engine — CORE ENGINE (Production Grade)
 ================================================================================
-engine.py contains ALL trading logic and NO Streamlit / UI code:
-    - Structured (JSON) logging
-    - SQLite trade ledger
-    - Thread-safe shared state (EngineState)
-    - Risk management layer (kill switch, max trades, cooldown, sizing)
-    - Expiry safety filter
-    - Entry-zone / limit-style execution with slippage simulation
-    - Choppy-market / overtrading protection
-    - Broker execution abstraction (paper + live hook)
-    - Fyers REST + WebSocket integration with TTL caching
-
-app.py (Streamlit) imports this module and never touches global state
-directly — it only calls functions/methods exposed here. This means the
-engine can also be driven headlessly (e.g. from a cron job, a CLI script,
-or a future live-trading daemon) without any Streamlit dependency at all.
-================================================================================
 """
 
 from __future__ import annotations
@@ -46,15 +30,13 @@ from fyers_apiv3 import fyersModel
 from fyers_apiv3.FyersWebsocket import data_ws
 
 # ==============================================================================
-# 1. STRUCTURED LOGGING  (requirement #7)
+# 1. STRUCTURED LOGGING
 # ==============================================================================
 IST_TZ = pytz.timezone("Asia/Kolkata")
 LOG_JSON_PATH = "engine_events.jsonl"
 
 
 class JsonFormatter(logging.Formatter):
-    """Emits one JSON object per line: timestamp, level, event, reason, message + extras."""
-
     def format(self, record: logging.LogRecord) -> str:
         payload = {
             "timestamp": datetime.now(IST_TZ).strftime("%Y-%m-%d %H:%M:%S.%f"),
@@ -65,7 +47,6 @@ class JsonFormatter(logging.Formatter):
         extra_data = getattr(record, "extra_data", None)
         if extra_data:
             for k, v in extra_data.items():
-                # keep payload JSON-serializable
                 try:
                     json.dumps(v)
                     payload[k] = v
@@ -147,25 +128,21 @@ STRIKES_AROUND_ATM = 4
 
 @dataclass
 class RiskConfig:
-    """All risk / execution knobs in one place. Passed explicitly into every
-    engine call — no hidden globals — so the same engine can safely run
-    multiple configs (e.g. in tests) without cross-talk."""
-
     capital: float = 100_000.0
-    risk_pct: float = 2.0                     # % of capital risked per trade
-    max_capital_per_trade_pct: float = 25.0    # hard cap on capital deployed per trade
-    daily_loss_limit_pct: float = 5.0          # kill switch threshold
+    risk_pct: float = 2.0
+    max_capital_per_trade_pct: float = 25.0
+    daily_loss_limit_pct: float = 5.0
     max_trades_per_day: int = 10
-    cooldown_seconds: int = 120                # 2 min default cooldown between trades
-    min_minutes_to_expiry: float = 30.0        # expiry safety filter (requirement #3)
-    slippage_pct: float = 0.15                 # realistic fill slippage, 0.10%-0.30% band
-    entry_zone_pct: float = 0.15               # +/- zone around reference entry price
-    entry_timeout_seconds: int = 90            # auto-cancel stale pending "limit" orders
+    cooldown_seconds: int = 120
+    min_minutes_to_expiry: float = 30.0
+    slippage_pct: float = 0.15
+    entry_zone_pct: float = 0.15
+    entry_timeout_seconds: int = 90
     choppy_filter_enabled: bool = True
 
 
 # ==============================================================================
-# 3. BLACK-SCHOLES IV & GREEKS ENGINE (kept, + memoized for performance)
+# 3. BLACK-SCHOLES IV & GREEKS ENGINE
 # ==============================================================================
 def get_dte_years(expiry_str: str) -> float:
     try:
@@ -178,14 +155,13 @@ def get_dte_years(expiry_str: str) -> float:
             return 0.0
 
         T = time_diff.total_seconds() / (365.0 * 24.0 * 3600.0)
-        min_years = 1.0 / (365.0 * 24.0 * 60.0)  # 1-minute floor for 0 DTE
+        min_years = 1.0 / (365.0 * 24.0 * 60.0)
         return max(T, min_years)
     except Exception:
         return 0.02
 
 
 def check_expiry_safety(expiry_str: str, min_minutes: float = 30.0) -> Tuple[bool, str]:
-    """Requirement #3 — Expiry safety filter. Blocks entries too close to expiry."""
     t_years = get_dte_years(expiry_str)
     minutes_left = t_years * 365.0 * 24.0 * 60.0
     if minutes_left < min_minutes:
@@ -259,17 +235,12 @@ def _compute_greeks_cached(S_r: float, K: float, T_r: float, price_r: float, opt
 
 
 def compute_live_greeks_fast(S: float, K: float, T: float, market_price: float, opt_type: str) -> dict:
-    """Requirement #5 — avoid unnecessary recalculation of the IV solver
-    (20 Newton-Raphson iterations each call) by memoizing on rounded inputs.
-    Spot/price/time rarely change meaningfully tick-to-tick, so this collapses
-    thousands of redundant solves per minute into a handful of cache hits."""
     IV, Delta, Gamma, Theta = _compute_greeks_cached(round(S, 1), K, round(T, 6), round(market_price, 2), opt_type)
     return {"IV": IV, "Delta": Delta, "Gamma": Gamma, "Theta": Theta}
 
 
 # ==============================================================================
-# 4. LIGHTWEIGHT TTL CACHE  (requirement #5 — replaces st.cache_data so the
-#    engine has zero Streamlit dependency and caching also works headlessly)
+# 4. LIGHTWEIGHT TTL CACHE
 # ==============================================================================
 class TTLCache:
     def __init__(self, ttl_seconds: float = 5.0):
@@ -283,7 +254,6 @@ class TTLCache:
             entry = self._store.get(key)
             if entry is not None and (now - entry[1]) < self.ttl:
                 return entry[0]
-        # compute outside the lock so slow network calls don't block other keys
         value = factory()
         with self._lock:
             self._store[key] = (value, time.time())
@@ -291,11 +261,11 @@ class TTLCache:
 
 
 _option_chain_cache = TTLCache(ttl_seconds=5.0)
-_candles_cache = TTLCache(ttl_seconds=5.0)
+_candles_cache = TTLCache(ttl_seconds=15.0)  # slightly longer TTL for history
 
 
 # ==============================================================================
-# 5. DATABASE LAYER (thread-safe via module lock; schema auto-migrates)
+# 5. DATABASE LAYER
 # ==============================================================================
 DB_LOCK = threading.Lock()
 
@@ -320,7 +290,6 @@ def init_db() -> None:
             )
             """
         )
-        # Non-destructive migration for new production-grade fields.
         for col, col_type in [
             ("entry_zone_low", "FLOAT"), ("entry_zone_high", "FLOAT"),
             ("entry_fill", "FLOAT"), ("slippage_pct", "FLOAT"),
@@ -428,13 +397,9 @@ def db_load_today_trades() -> Tuple[pd.DataFrame, float]:
 
 
 # ==============================================================================
-# 6. THREAD-SAFE ENGINE STATE  (requirement #4)
+# 6. THREAD-SAFE ENGINE STATE 
 # ==============================================================================
 class EngineState:
-    """
-    Centralized, thread-safe container for ALL mutable engine state.
-    """
-
     def __init__(self):
         self._lock = threading.RLock()
         self.tick_cache: Dict[str, dict] = {}
@@ -448,7 +413,6 @@ class EngineState:
         self.ws_worker = None
         self.ws_queue: "Queue" = Queue()
 
-    # ---------------------------------------------------------------- ticks
     def update_tick(self, symbol: str, ltp: float, bid_qty: float = 0, ask_qty: float = 0) -> None:
         with self._lock:
             self.tick_cache[symbol] = {
@@ -466,13 +430,11 @@ class EngineState:
         with self._lock:
             return list(self.micro_candles.get(symbol, []))
 
-    # ------------------------------------------------------------- bootstrap
     def hydrate_daily(self, pnl: float, trades_count: int) -> None:
         with self._lock:
             self.daily_pnl = pnl
             self.daily_trades_count = trades_count
 
-    # ------------------------------------------------------------ risk gates
     def _evaluate_risk_gates_locked(self, cfg: RiskConfig) -> Tuple[bool, str]:
         max_loss_amount = cfg.capital * (cfg.daily_loss_limit_pct / 100.0)
         if self.daily_pnl <= -max_loss_amount:
@@ -491,7 +453,6 @@ class EngineState:
         with self._lock:
             return self._evaluate_risk_gates_locked(cfg)
 
-    # ------------------------------------------------------- trade lifecycle
     def register_trade(self, index_symbol: str, trade: dict, cfg: RiskConfig) -> Tuple[bool, str]:
         with self._lock:
             if index_symbol in self.active_trades:
@@ -559,7 +520,7 @@ class EngineState:
 
                 if trade["status"] == "ENTERED" and live_ltp >= trade["target_1"]:
                     trade["status"] = "PARTIAL_EXIT"
-                    trade["sl"] = entry_ref  # trail SL to breakeven
+                    trade["sl"] = entry_ref 
                     return {"type": "PARTIAL_EXIT", "trade": dict(trade)}
 
                 if trade["status"] == "PARTIAL_EXIT" and live_ltp >= trade["target_2"]:
@@ -571,7 +532,6 @@ class EngineState:
                     return {"type": "TARGET_2", "trade": dict(trade)}
             return None
 
-    # -------------------------------------------------------------- misc UI
     def set_closed_message(self, msg: str) -> None:
         with self._lock:
             self.last_closed_message = msg
@@ -888,11 +848,14 @@ class FyersClientWrapper:
         self.fyers = fyersModel.FyersModel(client_id=client_id, token=access_token, is_async=False, log_path="")
 
 
-def _fetch_candles(client: FyersClientWrapper, symbol: str, resolution: str) -> pd.DataFrame:
-    today_str = datetime.now(IST_TZ).strftime("%Y-%m-%d")
+def _fetch_candles(client: FyersClientWrapper, symbol: str, resolution: str, days_back: int = 0) -> pd.DataFrame:
+    end_date_dt = datetime.now(IST_TZ)
+    start_date_dt = end_date_dt - pd.Timedelta(days=days_back)
     payload = {
         "symbol": symbol, "resolution": resolution, "date_format": "1",
-        "range_from": today_str, "range_to": today_str, "cont_flag": "1",
+        "range_from": start_date_dt.strftime("%Y-%m-%d"), 
+        "range_to": end_date_dt.strftime("%Y-%m-%d"), 
+        "cont_flag": "1",
     }
     try:
         res = client.fyers.history(data=payload)
@@ -906,8 +869,11 @@ def _fetch_candles(client: FyersClientWrapper, symbol: str, resolution: str) -> 
     return df
 
 
-def get_cached_candles(client: FyersClientWrapper, symbol: str, resolution: str = "1") -> pd.DataFrame:
-    return _candles_cache.get_or_set(f"candles:{symbol}:{resolution}", lambda: _fetch_candles(client, symbol, resolution))
+def get_cached_candles(client: FyersClientWrapper, symbol: str, resolution: str = "1", days_back: int = 0) -> pd.DataFrame:
+    return _candles_cache.get_or_set(
+        f"candles:{symbol}:{resolution}:{days_back}", 
+        lambda: _fetch_candles(client, symbol, resolution, days_back)
+    )
 
 
 def _fetch_option_chain(client: FyersClientWrapper, symbol: str) -> dict:
@@ -946,31 +912,87 @@ def get_cached_option_chain(client: FyersClientWrapper, symbol: str) -> dict:
 # ==============================================================================
 # 12. LIVE DUAL-MODE ANALYSIS & SIGNAL GENERATION
 # ==============================================================================
-def calculate_live_metrics(state: EngineState, spot_symbol: str, mode: str) -> dict:
+def calc_vwap_series(df: pd.DataFrame) -> pd.Series:
+    if df.empty:
+        return pd.Series(dtype=float)
+    q = df['volume']
+    p = (df['high'] + df['low'] + df['close']) / 3
+    return (p * q).cumsum() / q.cumsum()
+
+def calculate_live_metrics(client: FyersClientWrapper, state: EngineState, spot_symbol: str, mode: str) -> dict:
     micros = state.get_micro_candles(spot_symbol)
-    
-    obi_score = 0.0 
     velocity = "FLAT"
-    
     now = time.time()
     lookback_secs = 60 if mode == "Scalping" else 240
     
     valid_ticks = [x for x in micros if (now - x[0]) <= lookback_secs]
     prices_only = [x[1] for x in micros] 
     
-    if len(valid_ticks) >= 10:
+    if len(valid_ticks) >= 3:
         first_price = valid_ticks[0][1]
         last_price = valid_ticks[-1][1]
         pct_change = ((last_price - first_price) / first_price) * 100
         
         vel_threshold = 0.03 if mode == "Scalping" else 0.06
-        
         if pct_change > vel_threshold:
             velocity = "BULLISH_SURGE"
         elif pct_change < -vel_threshold:
             velocity = "BEARISH_SURGE"
 
-    return {"obi_score": obi_score, "velocity": velocity, "is_choppy": detect_choppy_market(prices_only)}
+    metrics = {
+        "velocity": velocity, 
+        "is_choppy": detect_choppy_market(prices_only),
+        "vwap_1m": 0.0, "vwap_5m": 0.0, "ema_9_5m": 0.0,
+        "orb_high": 0.0, "orb_low": 0.0, "rvol": 1.0,
+        "pdh": 0.0, "pdl": 0.0, "pdc": 0.0, "pivot": 0.0, "r1": 0.0, "s1": 0.0
+    }
+
+    # 1-Minute Structural Context (VWAP, ORB, RVOL)
+    df_1m = get_cached_candles(client, spot_symbol, resolution="1", days_back=0)
+    if not df_1m.empty and len(df_1m) > 0:
+        vwap_series = calc_vwap_series(df_1m)
+        if not vwap_series.empty:
+            metrics["vwap_1m"] = float(vwap_series.iloc[-1])
+        
+        df_1m['time_str'] = df_1m['datetime'].dt.strftime('%H:%M')
+        orb_df = df_1m[(df_1m['time_str'] >= '09:15') & (df_1m['time_str'] <= '09:30')]
+        if not orb_df.empty:
+            metrics["orb_high"] = float(orb_df['high'].max())
+            metrics["orb_low"] = float(orb_df['low'].min())
+            
+        if len(df_1m) > 10:
+            avg_vol = df_1m['volume'].rolling(10).mean().iloc[-2]
+            current_vol = df_1m['volume'].iloc[-1]
+            metrics["rvol"] = float(current_vol / max(1, avg_vol))
+
+    # 5-Minute Structural Context (EMA, VWAP)
+    df_5m = get_cached_candles(client, spot_symbol, resolution="5", days_back=0)
+    if not df_5m.empty and len(df_5m) > 0:
+        vwap_5m_series = calc_vwap_series(df_5m)
+        if not vwap_5m_series.empty:
+            metrics["vwap_5m"] = float(vwap_5m_series.iloc[-1])
+        if len(df_5m) >= 9:
+            metrics["ema_9_5m"] = float(df_5m['close'].ewm(span=9, adjust=False).mean().iloc[-1])
+
+    # Daily Structural Context (PDH, PDL, PDC, Pivots)
+    df_d = get_cached_candles(client, spot_symbol, resolution="D", days_back=5)
+    if not df_d.empty and len(df_d) > 1:
+        today_date = datetime.now(IST_TZ).date()
+        past_days = df_d[df_d['datetime'].dt.date < today_date]
+        if not past_days.empty:
+            prev_day = past_days.iloc[-1]
+            pdh = float(prev_day['high'])
+            pdl = float(prev_day['low'])
+            pdc = float(prev_day['close'])
+            pivot = (pdh + pdl + pdc) / 3
+            metrics.update({
+                "pdh": pdh, "pdl": pdl, "pdc": pdc,
+                "pivot": pivot,
+                "r1": (2 * pivot) - pdl,
+                "s1": (2 * pivot) - pdh
+            })
+
+    return metrics
 
 
 def process_option_chain_live(chain_raw: dict, cfg: IndexConfig, spot: float) -> dict:
@@ -1037,54 +1059,116 @@ def process_option_chain_live(chain_raw: dict, cfg: IndexConfig, spot: float) ->
     best_ce_ltp = float(atm_ce.iloc[0].get("ltp", 0.0)) if not atm_ce.empty else 0.0
     best_pe_ltp = float(atm_pe.iloc[0].get("ltp", 0.0)) if not atm_pe.empty else 0.0
 
-    best_ce_delta = compute_live_greeks_fast(spot, atm, t_years, best_ce_ltp, "CE")["Delta"] if not atm_ce.empty else 0.5
-    best_pe_delta = compute_live_greeks_fast(spot, atm, t_years, best_pe_ltp, "PE")["Delta"] if not atm_pe.empty else -0.5
+    ce_greeks = compute_live_greeks_fast(spot, atm, t_years, best_ce_ltp, "CE") if not atm_ce.empty else {"IV": 0, "Delta": 0.5}
+    pe_greeks = compute_live_greeks_fast(spot, atm, t_years, best_pe_ltp, "PE") if not atm_pe.empty else {"IV": 0, "Delta": -0.5}
 
     return {
         "oi_bias": oi_bias, "pcr": pcr, "expiry": expiry_str,
         "best_ce_sym": atm_ce.iloc[0]["symbol"] if not atm_ce.empty else None,
         "best_pe_sym": atm_pe.iloc[0]["symbol"] if not atm_pe.empty else None,
         "best_ce_ltp": best_ce_ltp, "best_pe_ltp": best_pe_ltp,
-        "best_ce_delta": best_ce_delta, "best_pe_delta": best_pe_delta,
+        "best_ce_delta": ce_greeks["Delta"], "best_pe_delta": pe_greeks["Delta"],
+        "best_ce_iv": ce_greeks["IV"], "best_pe_iv": pe_greeks["IV"],
         "mini_chain": mini_chain, "atm_strike": atm,
     }
 
 
-def generate_live_signal(spot_price: float, live_metrics: dict, oi_data: dict, mode: str) -> dict:
+def generate_live_signal(state: EngineState, spot_price: float, live_metrics: dict, oi_data: dict, mode: str) -> dict:
     score, conf = 0.0, 30
     is_scalping = (mode == "Scalping")
+    
+    now_ist = datetime.now(IST_TZ)
+    is_expiry_day = (oi_data.get("expiry") == now_ist.strftime("%Y-%m-%d"))
+    is_after_1330 = (now_ist.hour > 13) or (now_ist.hour == 13 and now_ist.minute >= 30)
 
+    # 1. Time-of-Day & Theta Decay Filter (0 DTE after 13:30)
+    if is_expiry_day and is_after_1330:
+        if mode == "Intraday":
+            return {"signal": "NO TRADE", "score": 0, "conf": 0, "reason": "0 DTE Intraday blocked after 13:30 (Theta Risk)"}
+        vel_threshold_mult = 2.0  # Require double velocity for scalps
+    else:
+        vel_threshold_mult = 1.0
+
+    # 2. RVOL Fakeout Protection
+    if live_metrics["velocity"] != "FLAT" and live_metrics.get("rvol", 1.0) < 1.0:
+        return {"signal": "NO TRADE", "score": 0, "conf": 0, "reason": "Low RVOL (< 1.0) on velocity surge."}
+
+    # 3. Price Momentum
     vel_weight = 2.5 if is_scalping else 1.5
+    vel_weight *= vel_threshold_mult
     if live_metrics["velocity"] == "BULLISH_SURGE":
         score += vel_weight; conf += 20
     elif live_metrics["velocity"] == "BEARISH_SURGE":
         score -= vel_weight; conf += 20
 
-    score += live_metrics["obi_score"] * 0.5
+    # 4. IV Crush Protection
+    best_ce_iv = oi_data.get("best_ce_iv", 0)
+    best_pe_iv = oi_data.get("best_pe_iv", 0)
+    if (live_metrics["velocity"] == "BULLISH_SURGE" and best_ce_iv > 25) or \
+       (live_metrics["velocity"] == "BEARISH_SURGE" and best_pe_iv > 25):
+        score -= 2.0
+        conf -= 10
 
+    # 5. Options Order Book Imbalance (OBI)
+    ce_sym, pe_sym = oi_data.get("best_ce_sym"), oi_data.get("best_pe_sym")
+    if ce_sym and pe_sym:
+        ce_tick = state.get_tick(ce_sym)
+        pe_tick = state.get_tick(pe_sym)
+        if ce_tick and (ce_tick.get("bid_qty", 0) + ce_tick.get("ask_qty", 0)) > 0:
+            if (ce_tick["bid_qty"] / (ce_tick["bid_qty"] + ce_tick["ask_qty"])) > 0.65:
+                score += 2.0; conf += 15
+        if pe_tick and (pe_tick.get("bid_qty", 0) + pe_tick.get("ask_qty", 0)) > 0:
+            if (pe_tick["bid_qty"] / (pe_tick["bid_qty"] + pe_tick["ask_qty"])) > 0.65:
+                score -= 2.0; conf += 15
+
+    # 6. Structural Context (VWAP 5-min & ORB)
+    vwap_5m = live_metrics.get("vwap_5m", 0.0)
+    orb_low = live_metrics.get("orb_low", 0.0)
+    
+    if vwap_5m > 0:
+        if spot_price < vwap_5m: 
+            score -= 2.0 
+        else: 
+            score += 1.0
+
+    if orb_low > 0 and spot_price < orb_low: 
+        score -= 3.0 
+
+    # 7. Spatial Filtering (PDH, Pivot Proximity)
+    pdh = live_metrics.get("pdh", 0.0)
+    r1 = live_metrics.get("r1", 0.0)
+    
+    if pdh > 0:
+        dist_to_pdh = pdh - spot_price
+        if 0 < dist_to_pdh <= 10 and live_metrics["velocity"] == "BULLISH_SURGE":
+            return {"signal": "NO TRADE", "score": score, "conf": conf, "reason": "Trap Filter: Spot right below PDH"}
+        elif spot_price > pdh and live_metrics["velocity"] == "BULLISH_SURGE":
+            score += 2.0 
+            
+    if r1 > 0 and abs(r1 - spot_price) / spot_price < 0.0015:
+        return {"signal": "NO TRADE", "score": score, "conf": conf, "reason": "Pivot Proximity: Spot extremely close to R1"}
+
+    # 8. Open Interest Data
     oi_weight = 2.0 if is_scalping else 3.0
-    if oi_data.get("oi_bias") == "BULLISH":
-        score += oi_weight; conf += 25
-    elif oi_data.get("oi_bias") == "BEARISH":
-        score -= oi_weight; conf += 25
+    if oi_data.get("oi_bias") == "BULLISH": score += oi_weight; conf += 25
+    elif oi_data.get("oi_bias") == "BEARISH": score -= oi_weight; conf += 25
 
     pcr = oi_data.get("pcr", 1.0)
-    if pcr > 1.2:
-        score += 1.5; conf += 15
-    elif pcr < 0.8:
-        score -= 1.5; conf += 15
+    if pcr > 1.2: score += 1.5; conf += 15
+    elif pcr < 0.8: score -= 1.5; conf += 15
 
+    # Delta Filter
     if score > 0 and abs(oi_data.get("best_ce_delta", 0.5)) < 0.30:
-        return {"signal": "NO TRADE", "score": score, "conf": conf, "reason": "CE Delta Filter Rejected (< 0.30)"}
+        return {"signal": "NO TRADE", "score": score, "conf": conf, "reason": "CE Delta < 0.30"}
     elif score < 0 and abs(oi_data.get("best_pe_delta", -0.5)) < 0.30:
-        return {"signal": "NO TRADE", "score": score, "conf": conf, "reason": "PE Delta Filter Rejected (< 0.30)"}
+        return {"signal": "NO TRADE", "score": score, "conf": conf, "reason": "PE Delta < 0.30"}
 
-    threshold = 2.0 if is_scalping else 3.0 
+    threshold = 4.5 if is_scalping else 5.0 
     signal = "BUY CALL" if score >= threshold else "BUY PUT" if score <= -threshold else "NO TRADE"
 
     return {
         "signal": signal, "score": round(score, 2), "conf": min(100, max(0, int(conf))),
-        "reason": f"[{mode}] Score: {score:.1f} (Req: ±{threshold})",
+        "reason": f"[{mode}] Score: {score:.1f} (Req: ±{threshold}) | VWAP: {'Abv' if spot_price>vwap_5m else 'Blw'}",
     }
 
 
@@ -1105,7 +1189,7 @@ def calculate_dynamic_trade_levels(client: FyersClientWrapper, state: EngineStat
     t2_mult = 1.5 if mode == "Scalping" else 3.5
     buffer_pct = 0.0025 if mode == "Scalping" else 0.0040
 
-    opt_df = get_cached_candles(client, symbol, resolution=res)
+    opt_df = get_cached_candles(client, symbol, resolution=res, days_back=0)
     if not opt_df.empty and len(opt_df) >= 14:
         opt_df["tr0"] = (opt_df["high"] - opt_df["low"]).abs()
         opt_df["tr1"] = (opt_df["high"] - opt_df["close"].shift()).abs()
