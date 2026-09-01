@@ -584,7 +584,16 @@ def process_tick_queue(state: EngineState, cfg_provider: Callable[[], RiskConfig
             if not symbol or ltp <= 0:
                 continue
 
-            state.update_tick(symbol, ltp, message.get("total_buy_qty", 0), message.get("total_sell_qty", 0))
+            bids = message.get("bids", [])
+            asks = message.get("asks", [])
+            if bids and asks:
+                live_bid_qty = sum(b.get("volume", 0) for b in bids)
+                live_ask_qty = sum(a.get("volume", 0) for a in asks)
+            else:
+                live_bid_qty = message.get("total_buy_qty", 0)
+                live_ask_qty = message.get("total_sell_qty", 0)
+
+            state.update_tick(symbol, ltp, live_bid_qty, live_ask_qty)
 
             cfg = cfg_provider()
             for index_symbol, trade in list(state.active_trades.items()):
@@ -598,6 +607,7 @@ def process_tick_queue(state: EngineState, cfg_provider: Callable[[], RiskConfig
             log_error("tick_queue_processing", e)
         finally:
             state.ws_queue.task_done()
+
 
 
 def start_tick_worker(state: EngineState, cfg_provider: Callable[[], RiskConfig],
