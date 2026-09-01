@@ -433,21 +433,6 @@ def db_load_today_trades() -> Tuple[pd.DataFrame, float]:
 class EngineState:
     """
     Centralized, thread-safe container for ALL mutable engine state.
-
-    Design rationale: the original code spread state across a single global
-    dict guarded by two separate locks (DB_LOCK, TICK_LOCK), but the actual
-    trade state-machine transitions (WAITING -> ENTERED -> PARTIAL_EXIT ->
-    CLOSED) were mutated with NO lock at all inside `process_live_trade`,
-    and gating counters (`daily_trades_count`, `last_trade_time`) were
-    read in one place and written in another with no atomicity — a classic
-    check-then-act race under concurrent ticks / concurrent UI clicks.
-
-    Here every read-modify-write sequence that must be atomic happens
-    inside a single critical section (`self._lock`, a re-entrant RLock).
-    Slow I/O (DB writes, JSON logging) is NEVER performed while holding the
-    lock — callers get a small immutable "event" describing what happened
-    and persist it afterwards. This keeps the lock held for microseconds
-    even under heavy tick load.
     """
 
     def __init__(self):
@@ -469,8 +454,8 @@ class EngineState:
             self.tick_cache[symbol] = {
                 "ltp": round(ltp, 2), "ts": time.time(), "bid_qty": bid_qty, "ask_qty": ask_qty,
             }
-            candles = self.micro_candles.setdefault(symbol, deque(maxlen=300))
-            candles.append(ltp)
+            candles = self.micro_candles.setdefault(symbol, deque(maxlen=600))
+            candles.append((time.time(), ltp))
 
     def get_tick(self, symbol: str) -> Optional[dict]:
         with self._lock:
@@ -508,10 +493,6 @@ class EngineState:
 
     # ------------------------------------------------------- trade lifecycle
     def register_trade(self, index_symbol: str, trade: dict, cfg: RiskConfig) -> Tuple[bool, str]:
-        """Atomically: (1) reject duplicate entries for the same index,
-        (2) re-check all risk gates, (3) commit. All-or-nothing under lock —
-        this is what prevents double-order race conditions (requirement #1 &
-        #4 combined)."""
         with self._lock:
             if index_symbol in self.active_trades:
                 return False, "🚫 Duplicate entry blocked — a trade is already active/pending for this index."
@@ -542,9 +523,6 @@ class EngineState:
 
     def process_tick_for_trade(self, index_symbol: str, live_ltp: float, lot_size: int,
                                 cfg: RiskConfig) -> Optional[dict]:
-        """Advance ONE trade's state machine on a new tick, atomically.
-        Returns an event dict for the caller to persist/log OUTSIDE the lock,
-        or None if nothing happened this tick."""
         with self._lock:
             trade = self.active_trades.get(index_symbol)
             if trade is None:
@@ -606,8 +584,6 @@ class EngineState:
 
 
 def handle_trade_event(state: EngineState, event: dict) -> None:
-    """All slow I/O (DB writes, JSON ledger, structured logs) happens HERE,
-    outside of EngineState's lock."""
     trade, etype = event["trade"], event["type"]
     db_id = trade.get("db_id")
     try:
@@ -638,10 +614,6 @@ def handle_trade_event(state: EngineState, event: dict) -> None:
 
 def process_tick_queue(state: EngineState, cfg_provider: Callable[[], RiskConfig],
                         lot_size_lookup: Callable[[str], int]) -> None:
-    """Background worker: drains the WS queue, updates tick cache, and
-    advances any trade waiting on that option symbol. `cfg_provider` is a
-    callable (not a static object) so the UI can change risk settings live
-    without restarting this thread."""
     while True:
         message = state.ws_queue.get()
         try:
@@ -676,7 +648,7 @@ def start_tick_worker(state: EngineState, cfg_provider: Callable[[], RiskConfig]
 
 
 # ==============================================================================
-# 7. ENTRY EXECUTION LOGIC  (requirement #1 — CRITICAL FIX)
+# 7. ENTRY EXECUTION LOGIC
 # ==============================================================================
 def compute_entry_zone(reference_price: float, zone_pct: float) -> Tuple[float, float]:
     half = reference_price * (zone_pct / 100.0)
@@ -684,40 +656,21 @@ def compute_entry_zone(reference_price: float, zone_pct: float) -> Tuple[float, 
 
 
 def try_fill_entry(trade: dict, live_ltp: float, slippage_pct: float) -> Optional[float]:
-    """
-    Replaces the old `if live_ltp >= entry:` snap-fill (which produced
-    unrealistic fills and missed fast moves) with zone/limit-style execution:
-
-      1. The order only fills once price trades INSIDE [zone_low, zone_high],
-         simulating a limit/marketable-limit order instead of chasing price.
-      2. A configurable slippage (0.10%-0.30%) is applied AGAINST the trader
-         on fill, so PnL reflects a realistic execution rather than the
-         theoretical tick price.
-      3. If price gaps straight through the zone without ever printing
-         inside it, the order simply stays WAITING (never chases) until the
-         entry-timeout auto-cancels it (see EngineState.process_tick_for_trade).
-
-    Must be called while the caller already holds EngineState._lock.
-    """
     zone_low = trade.get("entry_zone_low")
     zone_high = trade.get("entry_zone_high")
     if zone_low is None or zone_high is None:
         zone_low, zone_high = compute_entry_zone(trade["entry"], trade.get("entry_zone_pct", 0.15))
 
     if zone_low <= live_ltp <= zone_high:
-        # Buying an option: slippage makes the realistic fill slightly WORSE (higher).
         fill_price = round(live_ltp * (1 + slippage_pct / 100.0), 2)
         return fill_price
     return None
 
 
 # ==============================================================================
-# 8. RISK MANAGEMENT LAYER  (requirement #2)
+# 8. RISK MANAGEMENT LAYER
 # ==============================================================================
 def detect_choppy_market(prices: List[float], window: int = 60) -> bool:
-    """Simple whipsaw detector: many sign changes in recent tick deltas with
-    little net displacement = choppy / range-bound = high false-signal risk.
-    Used to block new entries and prevent overtrading in a chop regime."""
     if len(prices) < window:
         return False
     arr = np.array(prices[-window:], dtype=float)
@@ -731,9 +684,6 @@ def detect_choppy_market(prices: List[float], window: int = 60) -> bool:
 
 
 def calculate_position_size(state: EngineState, cfg: RiskConfig, entry: float, sl: float, lot_size: int) -> dict:
-    """Requirement #2 — capital-based sizing with a hard safety cap
-    independent of `risk_pct`, so a fat-fingered risk% setting can never
-    deploy more than `max_capital_per_trade_pct` of capital on one trade."""
     allowed, reason = state.can_trade(cfg)
     if not allowed:
         return {"allowed": False, "reason": reason, "lots": 0}
@@ -761,9 +711,6 @@ def calculate_position_size(state: EngineState, cfg: RiskConfig, entry: float, s
 
 def evaluate_all_entry_filters(state: EngineState, cfg: RiskConfig, expiry_str: str,
                                 micro_candles: List[float]) -> Tuple[bool, str]:
-    """Single funnel combining risk gates -> expiry safety -> chop filter.
-    Any failure returns (False, human-readable reason) suitable for direct
-    display as "NO TRADE: <reason>"."""
     ok, reason = state.can_trade(cfg)
     if not ok:
         return False, reason
@@ -772,21 +719,17 @@ def evaluate_all_entry_filters(state: EngineState, cfg: RiskConfig, expiry_str: 
     if not ok:
         return False, reason
 
-    if cfg.choppy_filter_enabled and detect_choppy_market(micro_candles):
+    prices_only = [x[1] for x in micro_candles] if micro_candles else []
+    if cfg.choppy_filter_enabled and detect_choppy_market(prices_only):
         return False, "🌊 NO TRADE — Choppy/range-bound market detected. Standing aside to avoid overtrading."
 
     return True, "All entry filters passed."
 
 
 # ==============================================================================
-# 9. BROKER EXECUTION ABSTRACTION  (requirement #6 — live trading hooks)
+# 9. BROKER EXECUTION ABSTRACTION
 # ==============================================================================
 class BrokerExecutor(ABC):
-    """Abstract execution layer. Every order in the engine goes through this
-    interface, so swapping PaperBrokerExecutor for a live implementation
-    (e.g. FyersLiveBrokerExecutor) requires ZERO changes to signal, risk, or
-    state-machine logic above."""
-
     @abstractmethod
     def place_order(self, symbol: str, side: str, qty: int, order_type: str = "MARKET",
                      limit_price: Optional[float] = None) -> dict:
@@ -802,9 +745,6 @@ class BrokerExecutor(ABC):
 
 
 class PaperBrokerExecutor(BrokerExecutor):
-    """Default executor: simulates realistic fills off the live tick cache
-    with configurable slippage. No real orders are ever sent."""
-
     def __init__(self, state: EngineState, slippage_pct: float = 0.15):
         self.state = state
         self.slippage_pct = slippage_pct
@@ -831,15 +771,6 @@ class PaperBrokerExecutor(BrokerExecutor):
 
 
 class FyersLiveBrokerExecutor(BrokerExecutor):
-    """
-    LIVE TRADING HOOK — not wired into the UI by default.
-    When ready to go live, instantiate this with a real FyersClientWrapper
-    and pass it wherever PaperBrokerExecutor is used today. The payload
-    below follows the Fyers v3 order schema; review it against the latest
-    Fyers API docs and add your own order-confirmation / retry policy
-    before enabling real capital.
-    """
-
     def __init__(self, client: "FyersClientWrapper"):
         self.client = client
 
@@ -950,7 +881,7 @@ class FyersWebSocketWorker(threading.Thread):
 
 
 # ==============================================================================
-# 11. FYERS REST API LOGIC (TTL-cached — requirement #5)
+# 11. FYERS REST API LOGIC (TTL-cached)
 # ==============================================================================
 class FyersClientWrapper:
     def __init__(self, client_id: str, access_token: str):
@@ -1009,9 +940,6 @@ def _fetch_option_chain(client: FyersClientWrapper, symbol: str) -> dict:
 
 
 def get_cached_option_chain(client: FyersClientWrapper, symbol: str) -> dict:
-    """Requirement #5 — single TTL cache shared across all callers/tabs so the
-    same index's option chain is fetched at most once every 5s, no matter how
-    many UI components request it in the same rerun."""
     return _option_chain_cache.get_or_set(f"chain:{symbol}", lambda: _fetch_option_chain(client, symbol))
 
 
@@ -1019,32 +947,30 @@ def get_cached_option_chain(client: FyersClientWrapper, symbol: str) -> dict:
 # 12. LIVE DUAL-MODE ANALYSIS & SIGNAL GENERATION
 # ==============================================================================
 def calculate_live_metrics(state: EngineState, spot_symbol: str, mode: str) -> dict:
-    cache = state.get_tick(spot_symbol) or {}
     micros = state.get_micro_candles(spot_symbol)
-
-    obi_score, velocity = 0.0, "FLAT"
-
-    bid_qty, ask_qty = cache.get("bid_qty", 0), cache.get("ask_qty", 0)
-    total_depth = bid_qty + ask_qty
-    if total_depth > 0:
-        obi_ratio = bid_qty / total_depth
-        if obi_ratio > 0.65:
-            obi_score = 1.0
-        elif obi_ratio < 0.35:
-            obi_score = -1.0
-
-    tick_window = 60 if mode == "Scalping" else 240
-    vel_threshold = 0.02 if mode == "Scalping" else 0.08
-
-    if len(micros) >= tick_window:
-        first, last = micros[-tick_window], micros[-1]
-        pct_change = ((last - first) / first) * 100
+    
+    obi_score = 0.0 
+    velocity = "FLAT"
+    
+    now = time.time()
+    lookback_secs = 60 if mode == "Scalping" else 240
+    
+    valid_ticks = [x for x in micros if (now - x[0]) <= lookback_secs]
+    prices_only = [x[1] for x in micros] 
+    
+    if len(valid_ticks) >= 10:
+        first_price = valid_ticks[0][1]
+        last_price = valid_ticks[-1][1]
+        pct_change = ((last_price - first_price) / first_price) * 100
+        
+        vel_threshold = 0.03 if mode == "Scalping" else 0.06
+        
         if pct_change > vel_threshold:
             velocity = "BULLISH_SURGE"
         elif pct_change < -vel_threshold:
             velocity = "BEARISH_SURGE"
 
-    return {"obi_score": obi_score, "velocity": velocity, "is_choppy": detect_choppy_market(micros)}
+    return {"obi_score": obi_score, "velocity": velocity, "is_choppy": detect_choppy_market(prices_only)}
 
 
 def process_option_chain_live(chain_raw: dict, cfg: IndexConfig, spot: float) -> dict:
@@ -1058,7 +984,6 @@ def process_option_chain_live(chain_raw: dict, cfg: IndexConfig, spot: float) ->
 
     strike_col = "strike_price" if "strike_price" in df.columns else "strikePrice"
     type_col = "option_type" if "option_type" in df.columns else "optionType"
-    oi_col = "oi"
 
     near_df = df[(df[strike_col] >= atm - (STRIKES_AROUND_ATM * cfg.strike_step)) &
                  (df[strike_col] <= atm + (STRIKES_AROUND_ATM * cfg.strike_step))]
@@ -1066,12 +991,13 @@ def process_option_chain_live(chain_raw: dict, cfg: IndexConfig, spot: float) ->
     ce_df = near_df[near_df[type_col] == "CE"]
     pe_df = near_df[near_df[type_col] == "PE"]
 
+    oi_col = "oi"
     pcr = pe_df[oi_col].sum() / max(1, ce_df[oi_col].sum())
 
     bullish, bearish = 0.0, 0.0
     for _, row in near_df.iterrows():
-        prev_oi = row.get("prev_oi", row.get("pOI", 0))
-        oi_chg = row[oi_col] - prev_oi
+        oi_chg = row.get("oic", row.get("change_in_oi", 0)) 
+        
         if row[type_col] == "CE" and oi_chg < 0:
             bullish += 2.0
         elif row[type_col] == "CE" and oi_chg > 0:
@@ -1153,7 +1079,7 @@ def generate_live_signal(spot_price: float, live_metrics: dict, oi_data: dict, m
     elif score < 0 and abs(oi_data.get("best_pe_delta", -0.5)) < 0.30:
         return {"signal": "NO TRADE", "score": score, "conf": conf, "reason": "PE Delta Filter Rejected (< 0.30)"}
 
-    threshold = 2.0 if is_scalping else 3.5
+    threshold = 2.0 if is_scalping else 2.5 
     signal = "BUY CALL" if score >= threshold else "BUY PUT" if score <= -threshold else "NO TRADE"
 
     return {
@@ -1164,8 +1090,6 @@ def generate_live_signal(spot_price: float, live_metrics: dict, oi_data: dict, m
 
 def calculate_dynamic_trade_levels(client: FyersClientWrapper, state: EngineState, symbol: str,
                                     fallback_ltp: float, mode: str, cfg: RiskConfig) -> dict:
-    """Returns reference entry/SL/targets AND the pre-computed entry zone
-    used by the execution engine (requirement #1)."""
     current_ltp = 0.0
     tick = state.get_tick(symbol)
     if tick and (time.time() - tick["ts"] <= 10.0):
@@ -1211,9 +1135,6 @@ def calculate_dynamic_trade_levels(client: FyersClientWrapper, state: EngineStat
 # ==============================================================================
 def place_paper_trade(state: EngineState, cfg: RiskConfig, index_symbol: str, opt_symbol: str,
                        strike: float, opt_type: str, signal_name: str, levels: dict, lots: int) -> Tuple[bool, str, Optional[dict]]:
-    """High-level helper wiring together everything above: builds the trade
-    object with entry-zone metadata, then atomically registers it (dedupe +
-    risk gates) via EngineState.register_trade. Returns (ok, message, trade)."""
     trade_obj = {
         "index_symbol": index_symbol, "signal": signal_name, "symbol": opt_symbol,
         "strike": strike, "type": opt_type, "lots": lots,
