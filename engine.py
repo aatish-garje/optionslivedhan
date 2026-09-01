@@ -1079,7 +1079,7 @@ def generate_live_signal(spot_price: float, live_metrics: dict, oi_data: dict, m
     elif score < 0 and abs(oi_data.get("best_pe_delta", -0.5)) < 0.30:
         return {"signal": "NO TRADE", "score": score, "conf": conf, "reason": "PE Delta Filter Rejected (< 0.30)"}
 
-    threshold = 2.0 if is_scalping else 2.5 
+    threshold = 2.0 if is_scalping else 3.0 
     signal = "BUY CALL" if score >= threshold else "BUY PUT" if score <= -threshold else "NO TRADE"
 
     return {
