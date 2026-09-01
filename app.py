@@ -45,10 +45,6 @@ def get_engine_state() -> EngineState:
 
 @st.cache_resource
 def get_tick_worker_started(_state: EngineState, _cfg_box: dict) -> bool:
-    """Starts the background tick-processing thread exactly once per process.
-    `_cfg_box` is a mutable dict the sidebar keeps updated so the worker
-    always reads the LATEST risk config without needing a restart."""
-
     def cfg_provider() -> RiskConfig:
         return _cfg_box["cfg"]
 
@@ -60,8 +56,6 @@ def get_tick_worker_started(_state: EngineState, _cfg_box: dict) -> bool:
     return True
 
 
-# A tiny mutable box so the tick-worker thread (started once) can still see
-# sidebar changes made on later reruns.
 if "cfg_box" not in st.session_state:
     st.session_state.cfg_box = {"cfg": RiskConfig()}
 
@@ -83,7 +77,7 @@ def build_risk_config(sidebar_values: dict) -> RiskConfig:
 
 
 def main():
-    st.set_page_config(page_title="Options Paper Trading Engine", layout="wide")
+    st.set_page_config(page_title="PRO Scalping & Intraday Paper Trading Engine", layout="wide")
     state = get_engine_state()
 
     if "initialized" not in st.session_state:
@@ -108,29 +102,23 @@ def main():
 
         broker_mode = st.radio(
             "Execution Mode", ["Paper (Simulated)", "Live (Coming Soon)"], index=0,
-            help="Live trading routes through engine.FyersLiveBrokerExecutor once wired up — "
-                 "kept disabled here so no real orders can be sent from this UI yet.",
+            help="Live trading routes through engine.FyersLiveBrokerExecutor once wired up.",
         )
         if broker_mode.startswith("Live"):
-            st.warning("🚧 Live execution hook exists in `engine.FyersLiveBrokerExecutor` but is not "
-                       "enabled from this UI. Wire it in only after independent testing.")
+            st.warning("🚧 Live execution hook exists in `engine.FyersLiveBrokerExecutor` but is not enabled from this UI yet.")
 
         st.subheader("Risk & Capital Controls")
         capital = st.number_input("Paper Capital (₹)", value=100000, step=10000)
         risk_pct = st.slider("Risk Per Trade (%)", 1.0, 5.0, 2.0)
-        max_capital_pct = st.slider("Max Capital Deployed / Trade (%)", 5.0, 50.0, 25.0,
-                                     help="Hard safety cap independent of Risk %.")
+        max_capital_pct = st.slider("Max Capital Deployed / Trade (%)", 5.0, 50.0, 25.0)
         daily_loss_limit = st.slider("Max Daily Drawdown (%) — Kill Switch", 2.0, 10.0, 5.0)
         max_trades = st.number_input("Max Daily Trades", min_value=1, max_value=20, value=10)
         cooldown_mins = st.number_input("Trade Cooldown (Mins)", min_value=0, max_value=60, value=2)
 
         st.subheader("Execution Realism")
-        slippage_pct = st.slider("Slippage (%)", 0.10, 0.30, 0.15, step=0.01,
-                                  help="Applied against the trader on fill, simulating real market impact.")
-        entry_zone_pct = st.slider("Entry Zone Width (±%)", 0.05, 0.50, 0.15, step=0.01,
-                                    help="Order fills only when price trades inside this zone (limit-style).")
-        entry_timeout_secs = st.number_input("Entry Order Timeout (secs)", min_value=15, max_value=600, value=90,
-                                              help="Pending orders auto-cancel if the zone is never reached.")
+        slippage_pct = st.slider("Slippage (%)", 0.10, 0.30, 0.15, step=0.01)
+        entry_zone_pct = st.slider("Entry Zone Width (±%)", 0.05, 0.50, 0.15, step=0.01)
+        entry_timeout_secs = st.number_input("Entry Order Timeout (secs)", min_value=15, max_value=600, value=90)
 
         st.subheader("Safety Filters")
         min_minutes_to_expiry = st.number_input("Min Minutes to Expiry", min_value=1, max_value=180, value=30)
@@ -143,7 +131,7 @@ def main():
             min_minutes_to_expiry=min_minutes_to_expiry, choppy_filter=choppy_filter,
         )
         cfg = build_risk_config(sidebar_values)
-        st.session_state.cfg_box["cfg"] = cfg  # keep the running tick worker in sync
+        st.session_state.cfg_box["cfg"] = cfg 
 
         if client_id and access_token:
             if len(access_token) > 50:
@@ -197,9 +185,6 @@ def main():
 
             active_trade = state.get_active_trade(idx_cfg.symbol)
 
-            # =========================
-            # ACTIVE POSITION VIEW
-            # =========================
             if active_trade:
                 live_opt_ltp = active_trade.get("entry_fill") or active_trade["entry"]
                 opt_tick = state.get_tick(active_trade["symbol"])
@@ -237,8 +222,6 @@ def main():
                             engine.db_update_trade(active_trade.get("db_id"), "CANCELLED", 0.0)
                             state.set_closed_message("🚫 Pending order cancelled by user.")
                         else:
-                            # Route the manual exit through the broker abstraction so it
-                            # gets a realistic (slippage-adjusted) fill, same as an SL/target exit.
                             fill = executor.place_order(active_trade["symbol"], "SELL", active_trade["lots"])
                             exit_price = fill["fill_price"]
                             lot_size = idx_cfg.lot_size
@@ -254,24 +237,20 @@ def main():
                             )
                         st.rerun()
 
-            # =========================
-            # TRADE SIGNAL & ENTRY VIEW
-            # =========================
             else:
                 chain_raw = get_cached_option_chain(client, idx_cfg.symbol)
                 oi_data = process_option_chain_live(chain_raw, idx_cfg, spot_price)
-                live_metrics = calculate_live_metrics(state, idx_cfg.symbol, engine_mode)
-                signal = generate_live_signal(spot_price, live_metrics, oi_data, engine_mode)
+                live_metrics = calculate_live_metrics(client, state, idx_cfg.symbol, engine_mode)
+                signal = generate_live_signal(state, spot_price, live_metrics, oi_data, engine_mode)
                 engine.log_signal(idx_cfg.symbol, signal)
 
                 col_info, col_chain = st.columns([1.1, 1.1])
 
                 with col_info:
                     st.write(f"**Target Expiry:** `{oi_data.get('expiry', 'Unknown')}`")
-                    obi_label = "Buyers" if live_metrics["obi_score"] > 0 else "Sellers" if live_metrics["obi_score"] < 0 else "Neutral"
-                    st.write(f"**Live Velocity:** `{live_metrics['velocity']}` | **Order Book:** `{obi_label}` | "
-                             f"**Chop Guard:** `{'CHOPPY' if live_metrics['is_choppy'] else 'clear'}`")
-                    st.write(f"**Signal Status:** `{signal['signal']}` (Conf: {signal['conf']}%) - {signal['reason']}")
+                    st.write(f"**Live Velocity:** `{live_metrics.get('velocity', 'FLAT')}` | "
+                             f"**Chop Guard:** `{'CHOPPY' if live_metrics.get('is_choppy') else 'clear'}`")
+                    st.write(f"**Signal Status:** `{signal['signal']}` (Conf: {signal['conf']}%) - {signal.get('reason', '')}")
 
                     micro_candles = state.get_micro_candles(idx_cfg.symbol)
                     gates_ok, gates_reason = evaluate_all_entry_filters(
